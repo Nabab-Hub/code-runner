@@ -827,3 +827,98 @@ def debug():
     result["cpu_count"] = os.cpu_count()
 
     return result
+
+
+@app.get("/debug-compile")
+def debug_compile():
+
+    import os
+    import subprocess
+    import tempfile
+
+    results = {}
+
+    with tempfile.TemporaryDirectory() as directory:
+
+        c_file = os.path.join(directory, "test.c")
+        exe_file = os.path.join(directory, "test")
+
+        with open(c_file, "w") as f:
+            f.write(
+                '#include <stdio.h>\n'
+                'int main() {\n'
+                '    printf("C compiler works!\\n");\n'
+                '    return 0;\n'
+                '}\n'
+            )
+
+        # --------------------------------------------------
+        # GCC
+        # --------------------------------------------------
+
+        try:
+
+            compile_result = subprocess.run(
+                [
+                    "gcc",
+                    c_file,
+                    "-o",
+                    exe_file
+                ],
+
+                capture_output=True,
+                text=True,
+
+                timeout=20,
+
+                # IMPORTANT:
+                # Do NOT use preexec_fn/resource limits here.
+                shell=False
+            )
+
+            results["gcc_return_code"] = (
+                compile_result.returncode
+            )
+
+            results["gcc_stdout"] = (
+                compile_result.stdout
+            )
+
+            results["gcc_stderr"] = (
+                compile_result.stderr
+            )
+
+            # ----------------------------------------------
+            # Execute compiled program
+            # ----------------------------------------------
+
+            if compile_result.returncode == 0:
+
+                run_result = subprocess.run(
+                    [exe_file],
+
+                    capture_output=True,
+                    text=True,
+
+                    timeout=5,
+
+                    shell=False
+                )
+
+                results["program_return_code"] = (
+                    run_result.returncode
+                )
+
+                results["program_stdout"] = (
+                    run_result.stdout
+                )
+
+                results["program_stderr"] = (
+                    run_result.stderr
+                )
+
+        except Exception as e:
+
+            results["gcc_exception"] = str(e)
+
+    return results
