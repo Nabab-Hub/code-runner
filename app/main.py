@@ -1,3 +1,4 @@
+import os
 import resource
 import subprocess
 import tempfile
@@ -15,23 +16,15 @@ app = FastAPI(title="Simple Code Runner")
 # CONFIGURATION
 # ============================================================
 
-MAX_CODE_SIZE = 50_000          # 50 KB
-MAX_INPUT_SIZE = 10_000         # 10 KB
-MAX_OUTPUT_SIZE = 2_000_000     # 2 MB
+MAX_CODE_SIZE = 50_000
+MAX_INPUT_SIZE = 10_000
+MAX_OUTPUT_SIZE = 2_000_000
 
-DEFAULT_TIMEOUT = 5
+RUN_TIMEOUT = 5
 COMPILE_TIMEOUT = 15
 
-# Render Free has limited RAM.
-# Keep some RAM available for FastAPI itself.
-DEFAULT_MEMORY_MB = 384
-
-# Allow compiler processes such as gcc -> cc1
-MAX_PROCESSES = 100
-
+MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_OPEN_FILES = 128
-
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 # ============================================================
@@ -39,6 +32,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 # ============================================================
 
 class RunRequest(BaseModel):
+
     language: str
 
     code: str = Field(
@@ -56,16 +50,18 @@ class RunRequest(BaseModel):
 # RESOURCE LIMITS
 # ============================================================
 
-def set_limits(
-    timeout: int = DEFAULT_TIMEOUT,
-    memory_mb: int = DEFAULT_MEMORY_MB,
-    processes: int = MAX_PROCESSES
-):
+def set_limits(timeout=5):
     """
-    Apply resource limits to the child process.
+    Apply only lightweight limits.
 
-    These limits are useful for a small project but should NOT
-    be considered a complete security sandbox.
+    IMPORTANT:
+    We intentionally DO NOT use:
+
+        RLIMIT_NPROC
+        RLIMIT_AS
+
+    because GCC/G++/Java need to create child processes
+    and allocate memory while compiling.
     """
 
     try:
@@ -79,46 +75,41 @@ def set_limits(
             (timeout, timeout)
         )
 
-        # ----------------------------------------------------
-        # MEMORY
-        # ----------------------------------------------------
+    except Exception:
+        pass
 
-        memory = memory_mb * 1024 * 1024
-
-        resource.setrlimit(
-            resource.RLIMIT_AS,
-            (memory, memory)
-        )
+    try:
 
         # ----------------------------------------------------
-        # NUMBER OF PROCESSES / THREADS
-        # ----------------------------------------------------
-
-        resource.setrlimit(
-            resource.RLIMIT_NPROC,
-            (processes, processes)
-        )
-
-        # ----------------------------------------------------
-        # OPEN FILES
+        # MAX OPEN FILES
         # ----------------------------------------------------
 
         resource.setrlimit(
             resource.RLIMIT_NOFILE,
-            (MAX_OPEN_FILES, MAX_OPEN_FILES)
+            (
+                MAX_OPEN_FILES,
+                MAX_OPEN_FILES
+            )
         )
 
+    except Exception:
+        pass
+
+    try:
+
         # ----------------------------------------------------
-        # MAXIMUM FILE SIZE
+        # MAX FILE SIZE
         # ----------------------------------------------------
 
         resource.setrlimit(
             resource.RLIMIT_FSIZE,
-            (MAX_FILE_SIZE, MAX_FILE_SIZE)
+            (
+                MAX_FILE_SIZE,
+                MAX_FILE_SIZE
+            )
         )
 
     except Exception:
-        # Some limits may not be available in every environment.
         pass
 
 
@@ -127,35 +118,40 @@ def set_limits(
 # ============================================================
 
 def safe_environment():
-    """
-    Do not expose Render environment variables or API keys
-    to submitted programs.
-    """
 
     return {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": "/tmp",
         "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
+        "LC_ALL": "C.UTF-8"
     }
 
 
 # ============================================================
-# EXECUTION FUNCTION
+# EXECUTE COMMAND
 # ============================================================
 
 def execute(
     command,
     cwd,
     stdin_data="",
-    timeout=DEFAULT_TIMEOUT,
-    memory_mb=DEFAULT_MEMORY_MB,
-    processes=MAX_PROCESSES
+    timeout=RUN_TIMEOUT,
+    apply_limits=True
 ):
 
     start = time.perf_counter()
 
     try:
+
+        if apply_limits:
+
+            preexec = lambda: set_limits(
+                timeout
+            )
+
+        else:
+
+            preexec = None
 
         process = subprocess.run(
 
@@ -169,33 +165,39 @@ def execute(
 
             cwd=cwd,
 
-            # VERY IMPORTANT
-            # Never use shell=True for user code.
             shell=False,
 
             timeout=timeout,
 
             env=safe_environment(),
 
-            preexec_fn=lambda: set_limits(
-                timeout=timeout,
-                memory_mb=memory_mb,
-                processes=processes
-            ),
+            preexec_fn=preexec
         )
 
-        elapsed = time.perf_counter() - start
+        elapsed = (
+            time.perf_counter() - start
+        )
 
         return {
-            "success": process.returncode == 0,
 
-            "return_code": process.returncode,
+            "success":
+                process.returncode == 0,
 
-            "stdout": process.stdout[:MAX_OUTPUT_SIZE],
+            "return_code":
+                process.returncode,
 
-            "stderr": process.stderr[:MAX_OUTPUT_SIZE],
+            "stdout":
+                process.stdout[
+                    :MAX_OUTPUT_SIZE
+                ],
 
-            "time": round(elapsed, 4),
+            "stderr":
+                process.stderr[
+                    :MAX_OUTPUT_SIZE
+                ],
+
+            "time":
+                round(elapsed, 4)
         }
 
     except subprocess.TimeoutExpired as e:
@@ -216,37 +218,27 @@ def execute(
             )
 
         return {
+
             "success": False,
 
             "return_code": -1,
 
-            "stdout": stdout[:MAX_OUTPUT_SIZE],
+            "stdout":
+                stdout[
+                    :MAX_OUTPUT_SIZE
+                ],
 
-            "stderr": "Execution timed out.",
+            "stderr":
+                "Execution timed out.",
 
-            "time": timeout,
-        }
-
-    except MemoryError:
-
-        return {
-            "success": False,
-
-            "return_code": -1,
-
-            "stdout": "",
-
-            "stderr": "Memory limit exceeded.",
-
-            "time": round(
-                time.perf_counter() - start,
-                4
-            ),
+            "time":
+                timeout
         }
 
     except Exception as e:
 
         return {
+
             "success": False,
 
             "return_code": -1,
@@ -255,10 +247,12 @@ def execute(
 
             "stderr": str(e),
 
-            "time": round(
-                time.perf_counter() - start,
-                4
-            ),
+            "time":
+                round(
+                    time.perf_counter()
+                    - start,
+                    4
+                )
         }
 
 
@@ -272,7 +266,10 @@ def run_python(
     directory
 ):
 
-    source = Path(directory) / "main.py"
+    source = (
+        Path(directory)
+        / "main.py"
+    )
 
     source.write_text(
         code,
@@ -290,11 +287,9 @@ def run_python(
 
         stdin_data,
 
-        timeout=DEFAULT_TIMEOUT,
+        timeout=RUN_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=True
     )
 
 
@@ -308,9 +303,15 @@ def run_c(
     directory
 ):
 
-    source = Path(directory) / "main.c"
+    source = (
+        Path(directory)
+        / "main.c"
+    )
 
-    executable = Path(directory) / "main"
+    executable = (
+        Path(directory)
+        / "main"
+    )
 
     source.write_text(
         code,
@@ -319,6 +320,10 @@ def run_c(
 
     # --------------------------------------------------------
     # COMPILE
+    #
+    # IMPORTANT:
+    # No resource limits during compilation.
+    # GCC needs to spawn cc1.
     # --------------------------------------------------------
 
     compile_result = execute(
@@ -335,27 +340,33 @@ def run_c(
 
         timeout=COMPILE_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=False
     )
 
     if not compile_result["success"]:
 
         return {
+
             "success": False,
 
-            "status": "Compilation Error",
+            "status":
+                "Compilation Error",
 
             "stdout": "",
 
-            "stderr": compile_result["stderr"],
+            "stderr":
+                compile_result["stderr"],
 
-            "compile_output": compile_result["stderr"],
+            "compile_output":
+                compile_result["stderr"],
 
-            "time": compile_result["time"],
+            "time":
+                compile_result["time"],
 
-            "return_code": compile_result["return_code"]
+            "return_code":
+                compile_result[
+                    "return_code"
+                ]
         }
 
     # --------------------------------------------------------
@@ -364,17 +375,17 @@ def run_c(
 
     result = execute(
 
-        [str(executable)],
+        [
+            str(executable)
+        ],
 
         directory,
 
         stdin_data,
 
-        timeout=DEFAULT_TIMEOUT,
+        timeout=RUN_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=True
     )
 
     result["compile_output"] = ""
@@ -392,9 +403,15 @@ def run_cpp(
     directory
 ):
 
-    source = Path(directory) / "main.cpp"
+    source = (
+        Path(directory)
+        / "main.cpp"
+    )
 
-    executable = Path(directory) / "main"
+    executable = (
+        Path(directory)
+        / "main"
+    )
 
     source.write_text(
         code,
@@ -420,27 +437,33 @@ def run_cpp(
 
         timeout=COMPILE_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=False
     )
 
     if not compile_result["success"]:
 
         return {
+
             "success": False,
 
-            "status": "Compilation Error",
+            "status":
+                "Compilation Error",
 
             "stdout": "",
 
-            "stderr": compile_result["stderr"],
+            "stderr":
+                compile_result["stderr"],
 
-            "compile_output": compile_result["stderr"],
+            "compile_output":
+                compile_result["stderr"],
 
-            "time": compile_result["time"],
+            "time":
+                compile_result["time"],
 
-            "return_code": compile_result["return_code"]
+            "return_code":
+                compile_result[
+                    "return_code"
+                ]
         }
 
     # --------------------------------------------------------
@@ -449,17 +472,17 @@ def run_cpp(
 
     result = execute(
 
-        [str(executable)],
+        [
+            str(executable)
+        ],
 
         directory,
 
         stdin_data,
 
-        timeout=DEFAULT_TIMEOUT,
+        timeout=RUN_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=True
     )
 
     result["compile_output"] = ""
@@ -477,7 +500,10 @@ def run_java(
     directory
 ):
 
-    source = Path(directory) / "Main.java"
+    source = (
+        Path(directory)
+        / "Main.java"
+    )
 
     source.write_text(
         code,
@@ -499,31 +525,37 @@ def run_java(
 
         timeout=COMPILE_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=False
     )
 
     if not compile_result["success"]:
 
         return {
+
             "success": False,
 
-            "status": "Compilation Error",
+            "status":
+                "Compilation Error",
 
             "stdout": "",
 
-            "stderr": compile_result["stderr"],
+            "stderr":
+                compile_result["stderr"],
 
-            "compile_output": compile_result["stderr"],
+            "compile_output":
+                compile_result["stderr"],
 
-            "time": compile_result["time"],
+            "time":
+                compile_result["time"],
 
-            "return_code": compile_result["return_code"]
+            "return_code":
+                compile_result[
+                    "return_code"
+                ]
         }
 
     # --------------------------------------------------------
-    # RUN JAVA
+    # RUN
     # --------------------------------------------------------
 
     result = execute(
@@ -546,11 +578,9 @@ def run_java(
 
         stdin_data,
 
-        timeout=DEFAULT_TIMEOUT,
+        timeout=RUN_TIMEOUT,
 
-        memory_mb=DEFAULT_MEMORY_MB,
-
-        processes=MAX_PROCESSES
+        apply_limits=True
     )
 
     result["compile_output"] = ""
@@ -559,45 +589,50 @@ def run_java(
 
 
 # ============================================================
-# MAIN RUN ENDPOINT
+# MAIN ENDPOINT
 # ============================================================
 
 @app.post("/run")
-def run_code(request: RunRequest):
+def run_code(
+    request: RunRequest
+):
 
-    language = request.language.lower().strip()
-
-    # --------------------------------------------------------
-    # ALLOWED LANGUAGES
-    # --------------------------------------------------------
+    language = (
+        request.language
+        .lower()
+        .strip()
+    )
 
     allowed_languages = {
+
         "python",
         "py",
+
         "c",
+
         "cpp",
         "c++",
+
         "java"
     }
 
     if language not in allowed_languages:
 
         return {
+
             "success": False,
 
-            "status": "Unsupported language",
+            "status":
+                "Unsupported language",
 
             "stdout": "",
 
-            "stderr": (
+            "stderr":
                 "Supported languages: "
-                "Python, C, C++, Java"
-            )
-        }
+                "Python, C, C++, Java",
 
-    # --------------------------------------------------------
-    # CREATE TEMPORARY DIRECTORY
-    # --------------------------------------------------------
+            "compile_output": ""
+        }
 
     try:
 
@@ -606,11 +641,14 @@ def run_code(request: RunRequest):
             dir="/tmp"
         ) as directory:
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # PYTHON
-            # -----------------------------------------------
+            # ------------------------------------------------
 
-            if language in ["python", "py"]:
+            if language in [
+                "python",
+                "py"
+            ]:
 
                 result = run_python(
 
@@ -621,9 +659,9 @@ def run_code(request: RunRequest):
                     directory
                 )
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # C
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             elif language == "c":
 
@@ -636,11 +674,14 @@ def run_code(request: RunRequest):
                     directory
                 )
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # C++
-            # -----------------------------------------------
+            # ------------------------------------------------
 
-            elif language in ["cpp", "c++"]:
+            elif language in [
+                "cpp",
+                "c++"
+            ]:
 
                 result = run_cpp(
 
@@ -651,9 +692,9 @@ def run_code(request: RunRequest):
                     directory
                 )
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # JAVA
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             elif language == "java":
 
@@ -669,24 +710,32 @@ def run_code(request: RunRequest):
             else:
 
                 return {
+
                     "success": False,
-                    "status": "Unsupported language"
+
+                    "status":
+                        "Unsupported language"
                 }
 
     except Exception as e:
 
         return {
+
             "success": False,
 
-            "status": "Runner Error",
+            "status":
+                "Runner Error",
 
             "stdout": "",
 
-            "stderr": str(e)
+            "stderr":
+                str(e),
+
+            "compile_output": ""
         }
 
     # ========================================================
-    # DETERMINE FINAL STATUS
+    # STATUS
     # ========================================================
 
     if result.get("status"):
@@ -699,10 +748,15 @@ def run_code(request: RunRequest):
 
     elif (
         "timed out"
-        in result.get("stderr", "").lower()
+        in result.get(
+            "stderr",
+            ""
+        ).lower()
     ):
 
-        status = "Time Limit Exceeded"
+        status = (
+            "Time Limit Exceeded"
+        )
 
     else:
 
@@ -714,32 +768,39 @@ def run_code(request: RunRequest):
 
     return {
 
-        "success": result["success"],
+        "success":
+            result["success"],
 
-        "status": status,
+        "status":
+            status,
 
-        "stdout": result.get(
-            "stdout",
-            ""
-        ),
+        "stdout":
+            result.get(
+                "stdout",
+                ""
+            ),
 
-        "stderr": result.get(
-            "stderr",
-            ""
-        ),
+        "stderr":
+            result.get(
+                "stderr",
+                ""
+            ),
 
-        "compile_output": result.get(
-            "compile_output",
-            ""
-        ),
+        "compile_output":
+            result.get(
+                "compile_output",
+                ""
+            ),
 
-        "return_code": result.get(
-            "return_code"
-        ),
+        "return_code":
+            result.get(
+                "return_code"
+            ),
 
-        "time": result.get(
-            "time"
-        )
+        "time":
+            result.get(
+                "time"
+            )
     }
 
 
@@ -754,19 +815,24 @@ def home():
 
         "status": "online",
 
-        "service": "Simple Code Runner",
+        "service":
+            "Simple Code Runner",
 
         "languages": [
+
             "python",
+
             "c",
+
             "cpp",
+
             "java"
         ]
     }
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/health")
@@ -774,151 +840,4 @@ def health():
 
     return {
         "status": "healthy"
-    }
-
-@app.get("/debug")
-def debug():
-
-    import os
-    import subprocess
-
-    result = {}
-
-    try:
-        result["gcc_version"] = subprocess.run(
-            ["gcc", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        ).stdout.splitlines()[0]
-    except Exception as e:
-        result["gcc_error"] = str(e)
-
-    try:
-        result["gpp_version"] = subprocess.run(
-            ["g++", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        ).stdout.splitlines()[0]
-    except Exception as e:
-        result["gpp_error"] = str(e)
-
-    try:
-        result["java_version"] = subprocess.run(
-            ["java", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        ).stderr
-    except Exception as e:
-        result["java_error"] = str(e)
-
-    try:
-        result["javac_version"] = subprocess.run(
-            ["javac", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        ).stderr
-    except Exception as e:
-        result["javac_error"] = str(e)
-
-    result["cpu_count"] = os.cpu_count()
-
-    return result
-
-
-@app.get("/debug-compile")
-def debug_compile():
-
-    import os
-    import subprocess
-    import tempfile
-
-    results = {}
-
-    with tempfile.TemporaryDirectory() as directory:
-
-        c_file = os.path.join(directory, "test.c")
-        exe_file = os.path.join(directory, "test")
-
-        with open(c_file, "w") as f:
-            f.write(
-                '#include <stdio.h>\n'
-                'int main() {\n'
-                '    printf("C compiler works!\\n");\n'
-                '    return 0;\n'
-                '}\n'
-            )
-
-        # --------------------------------------------------
-        # GCC
-        # --------------------------------------------------
-
-        try:
-
-            compile_result = subprocess.run(
-                [
-                    "gcc",
-                    c_file,
-                    "-o",
-                    exe_file
-                ],
-
-                capture_output=True,
-                text=True,
-
-                timeout=20,
-
-                # IMPORTANT:
-                # Do NOT use preexec_fn/resource limits here.
-                shell=False
-            )
-
-            results["gcc_return_code"] = (
-                compile_result.returncode
-            )
-
-            results["gcc_stdout"] = (
-                compile_result.stdout
-            )
-
-            results["gcc_stderr"] = (
-                compile_result.stderr
-            )
-
-            # ----------------------------------------------
-            # Execute compiled program
-            # ----------------------------------------------
-
-            if compile_result.returncode == 0:
-
-                run_result = subprocess.run(
-                    [exe_file],
-
-                    capture_output=True,
-                    text=True,
-
-                    timeout=5,
-
-                    shell=False
-                )
-
-                results["program_return_code"] = (
-                    run_result.returncode
-                )
-
-                results["program_stdout"] = (
-                    run_result.stdout
-                )
-
-                results["program_stderr"] = (
-                    run_result.stderr
-                )
-
-        except Exception as e:
-
-            results["gcc_exception"] = str(e)
-
-    return results
+        }
