@@ -1,5 +1,4 @@
-import os
-import signal
+import resource
 import subprocess
 import tempfile
 import time
@@ -12,81 +11,124 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Simple Code Runner")
 
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-MAX_CODE_SIZE = 50_000       # 50 KB
-MAX_INPUT_SIZE = 10_000      # 10 KB
-TIMEOUT_SECONDS = 5
-MEMORY_LIMIT_MB = 128
+MAX_CODE_SIZE = 50_000          # 50 KB
+MAX_INPUT_SIZE = 10_000         # 10 KB
+MAX_OUTPUT_SIZE = 2_000_000     # 2 MB
+
+DEFAULT_TIMEOUT = 5
+COMPILE_TIMEOUT = 15
+
+# Render Free has limited RAM.
+# Keep some RAM available for FastAPI itself.
+DEFAULT_MEMORY_MB = 384
+
+# Allow compiler processes such as gcc -> cc1
+MAX_PROCESSES = 100
+
+MAX_OPEN_FILES = 128
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
-# --------------------------------------------------
-# Request model
-# --------------------------------------------------
+# ============================================================
+# REQUEST MODEL
+# ============================================================
 
 class RunRequest(BaseModel):
     language: str
-    code: str = Field(max_length=MAX_CODE_SIZE)
-    stdin: str = Field(default="", max_length=MAX_INPUT_SIZE)
+
+    code: str = Field(
+        ...,
+        max_length=MAX_CODE_SIZE
+    )
+
+    stdin: str = Field(
+        default="",
+        max_length=MAX_INPUT_SIZE
+    )
 
 
-# --------------------------------------------------
-# Resource limits
-# --------------------------------------------------
+# ============================================================
+# RESOURCE LIMITS
+# ============================================================
 
-def set_limits():
+def set_limits(
+    timeout: int = DEFAULT_TIMEOUT,
+    memory_mb: int = DEFAULT_MEMORY_MB,
+    processes: int = MAX_PROCESSES
+):
     """
-    Applied inside the child process.
+    Apply resource limits to the child process.
+
+    These limits are useful for a small project but should NOT
+    be considered a complete security sandbox.
     """
 
     try:
-        import resource
 
-        # CPU time
+        # ----------------------------------------------------
+        # CPU TIME
+        # ----------------------------------------------------
+
         resource.setrlimit(
             resource.RLIMIT_CPU,
-            (TIMEOUT_SECONDS, TIMEOUT_SECONDS)
+            (timeout, timeout)
         )
 
-        # Maximum address space / memory
-        memory = MEMORY_LIMIT_MB * 1024 * 1024
+        # ----------------------------------------------------
+        # MEMORY
+        # ----------------------------------------------------
+
+        memory = memory_mb * 1024 * 1024
 
         resource.setrlimit(
             resource.RLIMIT_AS,
             (memory, memory)
         )
 
-        # Maximum number of processes
+        # ----------------------------------------------------
+        # NUMBER OF PROCESSES / THREADS
+        # ----------------------------------------------------
+
         resource.setrlimit(
             resource.RLIMIT_NPROC,
-            (20, 20)
+            (processes, processes)
         )
 
-        # Maximum number of open files
+        # ----------------------------------------------------
+        # OPEN FILES
+        # ----------------------------------------------------
+
         resource.setrlimit(
             resource.RLIMIT_NOFILE,
-            (64, 64)
+            (MAX_OPEN_FILES, MAX_OPEN_FILES)
         )
 
-        # Maximum output file size
+        # ----------------------------------------------------
+        # MAXIMUM FILE SIZE
+        # ----------------------------------------------------
+
         resource.setrlimit(
             resource.RLIMIT_FSIZE,
-            (2 * 1024 * 1024, 2 * 1024 * 1024)
+            (MAX_FILE_SIZE, MAX_FILE_SIZE)
         )
 
     except Exception:
+        # Some limits may not be available in every environment.
         pass
 
 
-# --------------------------------------------------
-# Environment
-# --------------------------------------------------
+# ============================================================
+# SAFE ENVIRONMENT
+# ============================================================
 
 def safe_environment():
     """
-    Don't expose the Render environment variables
+    Do not expose Render environment variables or API keys
     to submitted programs.
     """
 
@@ -98,72 +140,137 @@ def safe_environment():
     }
 
 
-# --------------------------------------------------
-# Execute command
-# --------------------------------------------------
+# ============================================================
+# EXECUTION FUNCTION
+# ============================================================
 
 def execute(
     command,
     cwd,
-    stdin_data=""
+    stdin_data="",
+    timeout=DEFAULT_TIMEOUT,
+    memory_mb=DEFAULT_MEMORY_MB,
+    processes=MAX_PROCESSES
 ):
+
     start = time.perf_counter()
 
     try:
+
         process = subprocess.run(
+
             command,
+
             input=stdin_data,
+
             text=True,
+
             capture_output=True,
+
             cwd=cwd,
 
-            # NEVER use shell=True
+            # VERY IMPORTANT
+            # Never use shell=True for user code.
             shell=False,
 
-            timeout=TIMEOUT_SECONDS,
+            timeout=timeout,
 
             env=safe_environment(),
 
-            preexec_fn=set_limits,
-
+            preexec_fn=lambda: set_limits(
+                timeout=timeout,
+                memory_mb=memory_mb,
+                processes=processes
+            ),
         )
 
         elapsed = time.perf_counter() - start
 
         return {
             "success": process.returncode == 0,
+
             "return_code": process.returncode,
-            "stdout": process.stdout[:2_000_000],
-            "stderr": process.stderr[:2_000_000],
+
+            "stdout": process.stdout[:MAX_OUTPUT_SIZE],
+
+            "stderr": process.stderr[:MAX_OUTPUT_SIZE],
+
             "time": round(elapsed, 4),
         }
 
     except subprocess.TimeoutExpired as e:
 
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(
+                "utf-8",
+                errors="replace"
+            )
+
         return {
             "success": False,
+
             "return_code": -1,
-            "stdout": e.stdout or "",
+
+            "stdout": stdout[:MAX_OUTPUT_SIZE],
+
             "stderr": "Execution timed out.",
-            "time": TIMEOUT_SECONDS,
+
+            "time": timeout,
+        }
+
+    except MemoryError:
+
+        return {
+            "success": False,
+
+            "return_code": -1,
+
+            "stdout": "",
+
+            "stderr": "Memory limit exceeded.",
+
+            "time": round(
+                time.perf_counter() - start,
+                4
+            ),
         }
 
     except Exception as e:
 
         return {
             "success": False,
+
             "return_code": -1,
+
             "stdout": "",
+
             "stderr": str(e),
-            "time": round(time.perf_counter() - start, 4),
+
+            "time": round(
+                time.perf_counter() - start,
+                4
+            ),
         }
 
 
-# --------------------------------------------------
-# Python
-# --------------------------------------------------
+# ============================================================
+# PYTHON
+# ============================================================
 
-def run_python(code, stdin_data, directory):
+def run_python(
+    code,
+    stdin_data,
+    directory
+):
 
     source = Path(directory) / "main.py"
 
@@ -173,22 +280,36 @@ def run_python(code, stdin_data, directory):
     )
 
     return execute(
+
         [
             "python3",
             str(source)
         ],
+
         directory,
-        stdin_data
+
+        stdin_data,
+
+        timeout=DEFAULT_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
 
-# --------------------------------------------------
+# ============================================================
 # C
-# --------------------------------------------------
+# ============================================================
 
-def run_c(code, stdin_data, directory):
+def run_c(
+    code,
+    stdin_data,
+    directory
+):
 
     source = Path(directory) / "main.c"
+
     executable = Path(directory) / "main"
 
     source.write_text(
@@ -196,7 +317,12 @@ def run_c(code, stdin_data, directory):
         encoding="utf-8"
     )
 
+    # --------------------------------------------------------
+    # COMPILE
+    # --------------------------------------------------------
+
     compile_result = execute(
+
         [
             "gcc",
             str(source),
@@ -204,24 +330,51 @@ def run_c(code, stdin_data, directory):
             "-o",
             str(executable)
         ],
-        directory
+
+        directory,
+
+        timeout=COMPILE_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
     if not compile_result["success"]:
 
         return {
             "success": False,
+
             "status": "Compilation Error",
+
             "stdout": "",
+
             "stderr": compile_result["stderr"],
+
             "compile_output": compile_result["stderr"],
+
             "time": compile_result["time"],
+
+            "return_code": compile_result["return_code"]
         }
 
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
+
     result = execute(
+
         [str(executable)],
+
         directory,
-        stdin_data
+
+        stdin_data,
+
+        timeout=DEFAULT_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
     result["compile_output"] = ""
@@ -229,13 +382,18 @@ def run_c(code, stdin_data, directory):
     return result
 
 
-# --------------------------------------------------
+# ============================================================
 # C++
-# --------------------------------------------------
+# ============================================================
 
-def run_cpp(code, stdin_data, directory):
+def run_cpp(
+    code,
+    stdin_data,
+    directory
+):
 
     source = Path(directory) / "main.cpp"
+
     executable = Path(directory) / "main"
 
     source.write_text(
@@ -243,7 +401,12 @@ def run_cpp(code, stdin_data, directory):
         encoding="utf-8"
     )
 
+    # --------------------------------------------------------
+    # COMPILE
+    # --------------------------------------------------------
+
     compile_result = execute(
+
         [
             "g++",
             str(source),
@@ -252,24 +415,51 @@ def run_cpp(code, stdin_data, directory):
             "-o",
             str(executable)
         ],
-        directory
+
+        directory,
+
+        timeout=COMPILE_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
     if not compile_result["success"]:
 
         return {
             "success": False,
+
             "status": "Compilation Error",
+
             "stdout": "",
+
             "stderr": compile_result["stderr"],
+
             "compile_output": compile_result["stderr"],
+
             "time": compile_result["time"],
+
+            "return_code": compile_result["return_code"]
         }
 
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
+
     result = execute(
+
         [str(executable)],
+
         directory,
-        stdin_data
+
+        stdin_data,
+
+        timeout=DEFAULT_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
     result["compile_output"] = ""
@@ -277,11 +467,15 @@ def run_cpp(code, stdin_data, directory):
     return result
 
 
-# --------------------------------------------------
-# Java
-# --------------------------------------------------
+# ============================================================
+# JAVA
+# ============================================================
 
-def run_java(code, stdin_data, directory):
+def run_java(
+    code,
+    stdin_data,
+    directory
+):
 
     source = Path(directory) / "Main.java"
 
@@ -290,36 +484,73 @@ def run_java(code, stdin_data, directory):
         encoding="utf-8"
     )
 
+    # --------------------------------------------------------
+    # COMPILE
+    # --------------------------------------------------------
+
     compile_result = execute(
+
         [
             "javac",
             str(source)
         ],
-        directory
+
+        directory,
+
+        timeout=COMPILE_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
     if not compile_result["success"]:
 
         return {
             "success": False,
+
             "status": "Compilation Error",
+
             "stdout": "",
+
             "stderr": compile_result["stderr"],
+
             "compile_output": compile_result["stderr"],
+
             "time": compile_result["time"],
+
+            "return_code": compile_result["return_code"]
         }
 
+    # --------------------------------------------------------
+    # RUN JAVA
+    # --------------------------------------------------------
+
     result = execute(
+
         [
             "java",
-            "-Xmx128m",
+
+            "-Xmx256m",
+
             "-Xss1m",
+
             "-cp",
+
             directory,
+
             "Main"
         ],
+
         directory,
-        stdin_data
+
+        stdin_data,
+
+        timeout=DEFAULT_TIMEOUT,
+
+        memory_mb=DEFAULT_MEMORY_MB,
+
+        processes=MAX_PROCESSES
     )
 
     result["compile_output"] = ""
@@ -327,110 +558,204 @@ def run_java(code, stdin_data, directory):
     return result
 
 
-# --------------------------------------------------
-# Main endpoint
-# --------------------------------------------------
+# ============================================================
+# MAIN RUN ENDPOINT
+# ============================================================
 
 @app.post("/run")
 def run_code(request: RunRequest):
 
     language = request.language.lower().strip()
 
-    allowed = {
+    # --------------------------------------------------------
+    # ALLOWED LANGUAGES
+    # --------------------------------------------------------
+
+    allowed_languages = {
         "python",
         "py",
         "c",
         "cpp",
         "c++",
-        "java",
+        "java"
     }
 
-    if language not in allowed:
+    if language not in allowed_languages:
 
         return {
             "success": False,
+
             "status": "Unsupported language",
+
+            "stdout": "",
+
+            "stderr": (
+                "Supported languages: "
+                "Python, C, C++, Java"
+            )
         }
 
-    # Temporary directory for THIS execution
-    with tempfile.TemporaryDirectory(
-        prefix="code_",
-        dir="/tmp"
-    ) as directory:
+    # --------------------------------------------------------
+    # CREATE TEMPORARY DIRECTORY
+    # --------------------------------------------------------
 
-        if language in ["python", "py"]:
+    try:
 
-            result = run_python(
-                request.code,
-                request.stdin,
-                directory
-            )
+        with tempfile.TemporaryDirectory(
+            prefix="code_",
+            dir="/tmp"
+        ) as directory:
 
-        elif language == "c":
+            # -----------------------------------------------
+            # PYTHON
+            # -----------------------------------------------
 
-            result = run_c(
-                request.code,
-                request.stdin,
-                directory
-            )
+            if language in ["python", "py"]:
 
-        elif language in ["cpp", "c++"]:
+                result = run_python(
 
-            result = run_cpp(
-                request.code,
-                request.stdin,
-                directory
-            )
+                    request.code,
 
-        elif language == "java":
+                    request.stdin,
 
-            result = run_java(
-                request.code,
-                request.stdin,
-                directory
-            )
+                    directory
+                )
 
-        else:
+            # -----------------------------------------------
+            # C
+            # -----------------------------------------------
 
-            return {
-                "success": False,
-                "status": "Unsupported language"
-            }
+            elif language == "c":
 
-    # Determine status
+                result = run_c(
+
+                    request.code,
+
+                    request.stdin,
+
+                    directory
+                )
+
+            # -----------------------------------------------
+            # C++
+            # -----------------------------------------------
+
+            elif language in ["cpp", "c++"]:
+
+                result = run_cpp(
+
+                    request.code,
+
+                    request.stdin,
+
+                    directory
+                )
+
+            # -----------------------------------------------
+            # JAVA
+            # -----------------------------------------------
+
+            elif language == "java":
+
+                result = run_java(
+
+                    request.code,
+
+                    request.stdin,
+
+                    directory
+                )
+
+            else:
+
+                return {
+                    "success": False,
+                    "status": "Unsupported language"
+                }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+
+            "status": "Runner Error",
+
+            "stdout": "",
+
+            "stderr": str(e)
+        }
+
+    # ========================================================
+    # DETERMINE FINAL STATUS
+    # ========================================================
+
     if result.get("status"):
+
         status = result["status"]
 
     elif result["success"]:
+
         status = "Accepted"
 
-    elif "timed out" in result["stderr"].lower():
+    elif (
+        "timed out"
+        in result.get("stderr", "").lower()
+    ):
+
         status = "Time Limit Exceeded"
 
     else:
+
         status = "Runtime Error"
 
+    # ========================================================
+    # RESPONSE
+    # ========================================================
+
     return {
+
         "success": result["success"],
+
         "status": status,
-        "stdout": result.get("stdout", ""),
-        "stderr": result.get("stderr", ""),
-        "compile_output": result.get("compile_output", ""),
-        "return_code": result.get("return_code"),
-        "time": result.get("time"),
+
+        "stdout": result.get(
+            "stdout",
+            ""
+        ),
+
+        "stderr": result.get(
+            "stderr",
+            ""
+        ),
+
+        "compile_output": result.get(
+            "compile_output",
+            ""
+        ),
+
+        "return_code": result.get(
+            "return_code"
+        ),
+
+        "time": result.get(
+            "time"
+        )
     }
 
 
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
+# ============================================================
+# HOME
+# ============================================================
 
 @app.get("/")
 def home():
 
     return {
+
         "status": "online",
+
         "service": "Simple Code Runner",
+
         "languages": [
             "python",
             "c",
@@ -439,6 +764,10 @@ def home():
         ]
     }
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/health")
 def health():
