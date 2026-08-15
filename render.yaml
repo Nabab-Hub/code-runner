@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: simple-code-runner
+    runtime: docker
+
+    dockerfilePath: ./Dockerfile
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
