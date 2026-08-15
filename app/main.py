@@ -775,3 +775,55 @@ def health():
     return {
         "status": "healthy"
     }
+
+@app.get("/debug")
+def debug():
+
+    import os
+    import subprocess
+
+    result = {}
+
+    try:
+        result["gcc_version"] = subprocess.run(
+            ["gcc", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        ).stdout.splitlines()[0]
+    except Exception as e:
+        result["gcc_error"] = str(e)
+
+    try:
+        result["gpp_version"] = subprocess.run(
+            ["g++", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        ).stdout.splitlines()[0]
+    except Exception as e:
+        result["gpp_error"] = str(e)
+
+    try:
+        result["java_version"] = subprocess.run(
+            ["java", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        ).stderr
+    except Exception as e:
+        result["java_error"] = str(e)
+
+    try:
+        result["javac_version"] = subprocess.run(
+            ["javac", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        ).stderr
+    except Exception as e:
+        result["javac_error"] = str(e)
+
+    result["cpu_count"] = os.cpu_count()
+
+    return result
