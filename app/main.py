@@ -7,10 +7,28 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
 
 
 app = FastAPI(title="Simple Code Runner")
 
+# ============================================================
+# CORS
+# ============================================================
+
+# Define the CORS middleware
+origins = [  # Allow frontend running on localhost:5173
+    "*"
+]
+
+# Add CORSMiddleware to the FastAPI app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Specify the allowed origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allow all headers
+)
 
 # ============================================================
 # CONFIGURATION
