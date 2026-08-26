@@ -18,7 +18,7 @@ app = FastAPI(title="Simple Code Runner")
 
 # Define the CORS middleware
 origins = [  # Allow frontend running on localhost:5173
-    "*"
+    "https://codingkamaza.vercel.app"
 ]
 
 # Add CORSMiddleware to the FastAPI app
