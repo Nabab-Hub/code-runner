@@ -1,3 +1,7 @@
+import utils.clients
+import utils.http_session
+import utils.transport
+import utils.session
 import os
 import resource
 import subprocess
@@ -18,7 +22,9 @@ app = FastAPI(title="Simple Code Runner")
 
 # Define the CORS middleware
 origins = [  # Allow frontend running on localhost:5173
-    "https://codingkamaza.vercel.app"
+    "https://codingkamaza.vercel.app",
+    "https://www.codingkamaza.in",
+    "https://codingkamaza.in"
 ]
 
 # Add CORSMiddleware to the FastAPI app
